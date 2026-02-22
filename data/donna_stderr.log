@@ -1,0 +1,10 @@
+Traceback (most recent call last):
+  File "/Users/manavchhattri/Desktop/Donna/run.py", line 56, in <module>
+    main()
+    ~~~~^^
+  File "/Users/manavchhattri/Desktop/Donna/run.py", line 50, in main
+    from donna.app import DonnaApp
+ModuleNotFoundError: No module named 'donna.app'
+/opt/homebrew/Cellar/python@3.13/3.13.0_1/Frameworks/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python: can't open file '/Users/manavchhattri/Desktop/Donna/run.py': [Errno 2] No such file or directory
+2026-02-22 02:02:04.729 DonnaMacApp[92086:560261] +[IMKClient subclass]: chose IMKClient_Modern
+2026-02-22 02:02:04.730 DonnaMacApp[92086:560261] +[IMKInputSession subclass]: chose IMKInputSession_Modern

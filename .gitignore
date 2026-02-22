@@ -1,0 +1,19 @@
+# macOS
+.DS_Store
+
+# SwiftPM build artifacts
+DonnaSwift/.build/
+DonnaSwift/.swiftpm/
+
+# Xcode/Swift user data
+**/xcuserdata/
+DerivedData/
+
+# Runtime app data (keep local, do not publish)
+data/*.json
+data/logs/*
+!data/.gitkeep
+!data/logs/.gitkeep
+
+# Local Python env leftovers
+.venv/

@@ -6,7 +6,7 @@ struct DonnaMacApp: App {
     @StateObject private var state = AppState()
 
     var body: some Scene {
-        MenuBarExtra(state.menuTitle, systemImage: "timer") {
+        MenuBarExtra {
             Button(state.trackingEnabled ? "Pause Tracking" : "Start Tracking") {
                 if state.trackingEnabled {
                     state.stopTracking()
@@ -22,23 +22,7 @@ struct DonnaMacApp: App {
             Divider()
 
             Button("Today's Summary") {
-                showSummaryAlert()
-            }
-
-            Button("Weekly Trends") {
-                showWeeklyTrendsAlert()
-            }
-
-            Button("Export CSV") {
-                exportCSV()
-            }
-
-            Button("Set Goal") {
-                showGoalPrompt()
-            }
-
-            Button("Categorise App…") {
-                showCategoriseAppPrompt()
+                showSummaryWindow()
             }
 
             Button(state.launchAtLoginEnabled ? "Disable Launch at Login" : "Enable Launch at Login") {
@@ -47,130 +31,35 @@ struct DonnaMacApp: App {
 
             Divider()
 
-            Text(state.presenceStatusText)
-
-            Button(state.presenceEnabled ? "Disable Camera Presence" : "Enable Camera Presence") {
-                state.togglePresence()
-            }
-
-            Divider()
-
-            Button("Save Now") {
-                state.saveNow()
-            }
-
-            Button("Quit") {
+            Button("Quit Donna") {
                 state.shutdown()
                 NSApplication.shared.terminate(nil)
             }
+            .keyboardShortcut("q")
+        } label: {
+            if let icon = state.frontmostAppIcon {
+                Image(nsImage: icon)
+            }
+            Text(state.menuTitle)
         }
-        .menuBarExtraStyle(.window)
+        .menuBarExtraStyle(.menu)
     }
 
-    private func showSummaryAlert() {
-        let alert = NSAlert()
-        alert.messageText = "Today's Summary"
-        alert.informativeText = state.summaryText()
-        alert.addButton(withTitle: "OK")
-        alert.runModal()
+    private func showSummaryWindow() {
+        SummaryWindowController.shared.show(data: state.summaryData())
     }
 
-    private func showGoalPrompt() {
-        NSApp.activate(ignoringOtherApps: true)
-
+    private func confirmResetToday() {
         let alert = NSAlert()
-        alert.messageText = "Set Daily Goal (hours)"
-        alert.informativeText = "Enter a positive number of hours."
-
-        let input = NSTextField(string: String(format: "%.1f", state.goals.goalHours))
-        input.frame = NSRect(x: 0, y: 0, width: 220, height: 24)
-        input.focusRingType = .exterior
-        alert.accessoryView = input
-        alert.window.initialFirstResponder = input
-
-        alert.addButton(withTitle: "Save")
+        alert.messageText = "Reset Today?"
+        alert.informativeText = "This clears today's active/idle and per-app totals."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Reset")
         alert.addButton(withTitle: "Cancel")
 
-        NSApp.activate(ignoringOtherApps: true)
-        DispatchQueue.main.async {
-            alert.window.makeKey()
-            alert.window.makeFirstResponder(input)
+        if alert.runModal() == .alertFirstButtonReturn {
+            state.resetToday()
         }
-
-        let response = alert.runModal()
-        if response == .alertFirstButtonReturn,
-           let value = Double(input.stringValue),
-           value > 0 {
-            state.setGoal(hours: value)
-        }
-    }
-
-    private func showWeeklyTrendsAlert() {
-        let alert = NSAlert()
-        alert.messageText = "Weekly Trends"
-        alert.informativeText = state.weeklyTrendsText()
-        alert.addButton(withTitle: "OK")
-        alert.runModal()
-    }
-
-    private func exportCSV() {
-        let alert = NSAlert()
-        if let path = state.exportTodayCSV() {
-            alert.messageText = "CSV Exported"
-            alert.informativeText = "Saved to:\n\(path.path)"
-        } else {
-            alert.messageText = "CSV Export Failed"
-            alert.informativeText = "Could not write CSV. Check permissions and logs."
-        }
-        alert.addButton(withTitle: "OK")
-        alert.runModal()
-    }
-
-    private func showCategoriseAppPrompt() {
-        let alert = NSAlert()
-        alert.messageText = "Categorise App"
-        alert.informativeText = "Set app category for tracking."
-
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 64))
-        let appField = NSTextField(string: state.tracking.currentApp == "—" ? "" : state.tracking.currentApp)
-        appField.placeholderString = "App name (e.g. Safari)"
-        appField.frame = NSRect(x: 0, y: 34, width: 320, height: 24)
-        appField.isEditable = true
-        appField.isSelectable = true
-        appField.focusRingType = .exterior
-
-        let categoryPicker = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 320, height: 28), pullsDown: false)
-        categoryPicker.addItems(withTitles: ["productive", "distracting", "neutral"])
-        categoryPicker.selectItem(withTitle: "neutral")
-
-        container.addSubview(appField)
-        container.addSubview(categoryPicker)
-        alert.accessoryView = container
-        alert.window.initialFirstResponder = appField
-
-        alert.addButton(withTitle: "Save")
-        alert.addButton(withTitle: "Cancel")
-
-        NSApp.activate(ignoringOtherApps: true)
-        DispatchQueue.main.async {
-            alert.window.makeKey()
-            alert.window.makeFirstResponder(appField)
-        }
-
-        let response = alert.runModal()
-        guard response == .alertFirstButtonReturn else { return }
-
-        let appName = appField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        let category = categoryPicker.selectedItem?.title ?? "neutral"
-        let ok = state.recategorise(appName: appName, category: category)
-
-        let result = NSAlert()
-        result.messageText = ok ? "Category Updated" : "Update Failed"
-        result.informativeText = ok
-            ? "\(appName) is now \(category)."
-            : "Provide a valid app name and category."
-        result.addButton(withTitle: "OK")
-        result.runModal()
     }
 
     private func toggleLaunchAtLogin() {
@@ -178,24 +67,202 @@ struct DonnaMacApp: App {
         let ok = state.setLaunchAtLogin(requested)
 
         let alert = NSAlert()
-        alert.messageText = ok ? "Launch at Login Updated" : "Launch at Login Failed"
-        alert.informativeText = ok
-            ? (state.launchAtLoginEnabled ? "Donna will start when you log in." : "Donna will not start at login.")
-            : "Could not change login launch setting. Check logs for details."
-        alert.addButton(withTitle: "OK")
-        alert.runModal()
+        alert.alertStyle = ok ? .informational : .warning
+
+        if ok {
+            if state.launchAtLoginEnabled {
+                alert.messageText = "Launch at Login Enabled"
+                alert.informativeText = "Donna will launch automatically when you sign in to macOS."
+            } else {
+                alert.messageText = "Launch at Login Disabled"
+                alert.informativeText = "Donna will no longer launch automatically when you sign in to macOS."
+            }
+            alert.addButton(withTitle: "Done")
+            alert.runModal()
+            return
+        }
+
+        alert.messageText = "Couldn’t Update Launch at Login"
+        alert.informativeText = "Donna couldn’t update Login Items from this run. You can change this in System Settings > General > Login Items."
+        alert.addButton(withTitle: "Open Login Items")
+        alert.addButton(withTitle: "Done")
+
+        let response = alert.runModal()
+        if response == .alertFirstButtonReturn,
+           let url = URL(string: "x-apple.systempreferences:com.apple.LoginItems-Settings.extension") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+}
+
+// MARK: - Summary Window Controller
+
+final class SummaryWindowController: NSWindowController {
+    static let shared = SummaryWindowController()
+
+    private init() {
+        let w = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 400, height: 480),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        w.title = "Today's Summary"
+        w.isReleasedWhenClosed = false
+        super.init(window: w)
     }
 
-    private func confirmResetToday() {
-        let alert = NSAlert()
-        alert.messageText = "Reset Today?"
-        alert.informativeText = "This clears today's active/idle/away and per-app totals."
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "Reset")
-        alert.addButton(withTitle: "Cancel")
+    required init?(coder: NSCoder) { fatalError() }
 
-        if alert.runModal() == .alertFirstButtonReturn {
-            state.resetToday()
+    func show(data: AppState.SummaryData) {
+        let view = SummaryView(data: data)
+        let hosting = NSHostingView(rootView: view)
+        hosting.frame.size = NSSize(width: 400, height: 480)
+        window?.contentView = hosting
+        window?.center()
+        showWindow(nil)
+        window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+}
+
+// MARK: - Summary SwiftUI View
+
+struct SummaryView: View {
+    let data: AppState.SummaryData
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            // Header
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Donna")
+                        .font(.system(size: 22, weight: .bold))
+                    Text(formattedDate(data.date))
+                        .font(.system(size: 12))
+                        .foregroundColor(.secondary)
+                }
+                Spacer()
+                VStack(alignment: .trailing, spacing: 2) {
+                    Text(data.activeTime)
+                        .font(.system(size: 32, weight: .heavy, design: .rounded))
+                    Text("active")
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary)
+                }
+            }
+            .padding(20)
+
+            // Divider
+            Rectangle()
+                .fill(Color.primary.opacity(0.08))
+                .frame(height: 1)
+                .padding(.horizontal, 20)
+
+            // Stats Grid
+            HStack(spacing: 10) {
+                StatCard(label: "IDE", value: data.ideTime, icon: "chevron.left.forwardslash.chevron.right")
+                StatCard(label: "AI Tools", value: data.aiTime, icon: "cpu")
+                StatCard(label: "AI %", value: "\(data.aiPercent)%", icon: "chart.bar.fill")
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 14)
+
+            // Divider
+            Rectangle()
+                .fill(Color.primary.opacity(0.08))
+                .frame(height: 1)
+                .padding(.horizontal, 20)
+
+            // Top Apps
+            VStack(alignment: .leading, spacing: 10) {
+                Text("TOP APPS")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundColor(.secondary)
+                    .kerning(0.5)
+
+                if data.topApps.isEmpty {
+                    Text("No tracked apps yet")
+                        .font(.system(size: 13))
+                        .foregroundColor(.secondary)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 12)
+                } else {
+                    VStack(spacing: 8) {
+                        ForEach(Array(data.topApps.enumerated()), id: \.offset) { _, app in
+                            AppRow(name: app.name, time: app.time, fraction: app.fraction)
+                        }
+                    }
+                }
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 14)
+
+            Spacer()
+        }
+        .frame(width: 400, height: 480)
+    }
+
+    private func formattedDate(_ iso: String) -> String {
+        let isoFmt = ISO8601DateFormatter()
+        isoFmt.formatOptions = [.withFullDate]
+        guard let date = isoFmt.date(from: iso) else { return iso }
+        let fmt = DateFormatter()
+        fmt.dateStyle = .long
+        return fmt.string(from: date)
+    }
+}
+
+struct StatCard: View {
+    let label: String
+    let value: String
+    let icon: String
+
+    var body: some View {
+        VStack(spacing: 6) {
+            Image(systemName: icon)
+                .font(.system(size: 12))
+                .foregroundColor(.secondary)
+            Text(value)
+                .font(.system(size: 16, weight: .bold, design: .rounded))
+            Text(label)
+                .font(.system(size: 10, weight: .medium))
+                .foregroundColor(.secondary)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 10)
+        .background(Color.primary.opacity(0.04))
+        .cornerRadius(8)
+    }
+}
+
+struct AppRow: View {
+    let name: String
+    let time: String
+    let fraction: Double
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(name)
+                    .font(.system(size: 13))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Spacer()
+                Text(time)
+                    .font(.system(size: 12, weight: .medium, design: .rounded))
+                    .foregroundColor(.secondary)
+            }
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    RoundedRectangle(cornerRadius: 3)
+                        .fill(Color.primary.opacity(0.06))
+                    RoundedRectangle(cornerRadius: 3)
+                        .fill(Color.accentColor)
+                        .frame(width: max(CGFloat(fraction) * geo.size.width, 4))
+                }
+            }
+            .frame(height: 6)
         }
     }
 }

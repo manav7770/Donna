@@ -1,6 +1,6 @@
 import Foundation
+import AppKit
 import os
-import UserNotifications
 import Combine
 
 @MainActor
@@ -9,65 +9,47 @@ final class AppState: ObservableObject {
     private let appLog = AppLog.shared
 
     let storage: StorageService
-    let categories: CategoryService
-    let goals: GoalService
     let tracking: TrackingService
-    let presence: PresenceService
-    let trends: TrendsService
     let launchAtLogin: LaunchAtLoginService
 
     @Published var trackingEnabled: Bool = false
     @Published var launchAtLoginEnabled: Bool = false
-    @Published var presenceEnabled: Bool = false
-    @Published var presenceIsAway: Bool = false
+    @Published var frontmostAppIcon: NSImage?
     private var maintenanceTimer: Timer?
-    private var lastMaintenanceTick: Date = .now
     private var saveCounterSeconds: TimeInterval = 0
     private var cancellables = Set<AnyCancellable>()
 
     init() {
         let dataDir = AppState.resolveDataDirectory()
         self.storage = StorageService(dataDirectory: dataDir)
-        self.categories = CategoryService(categoriesURL: dataDir.appendingPathComponent("categories.json"))
-        self.goals = GoalService(
-            goalsURL: dataDir.appendingPathComponent("goals.json"),
-            categoryService: categories
-        )
         self.tracking = TrackingService()
-        self.presence = PresenceService()
-        self.presenceEnabled = presence.isEnabled
-        self.presenceIsAway = presence.isAway
-        self.trends = TrendsService(storage: storage, categories: categories)
         self.launchAtLogin = LaunchAtLoginService()
         self.launchAtLoginEnabled = launchAtLogin.isEnabled()
-        setupPresenceBindings()
+        bindTrackingChanges()
+
+        // Enable launch-at-login by default on first run
+        let hasSetLogin = UserDefaults.standard.bool(forKey: "donna.hasSetLaunchAtLogin")
+        if !hasSetLogin {
+            setLaunchAtLogin(true)
+            UserDefaults.standard.set(true, forKey: "donna.hasSetLaunchAtLogin")
+        }
 
         if let existing = storage.load(date: DailyRecord.today()) {
             tracking.load(record: existing)
         }
 
-        requestNotificationPermission()
-
         logger.info("app state initialized with data dir=\(dataDir.path, privacy: .public)")
         appLog.log(.info, category: "appstate", "initialized", metadata: ["data_dir": dataDir.path])
+
+        requestPermissionsOnFirstLaunch()
         startAll()
     }
 
     func startAll() {
         tracking.start()
         trackingEnabled = true
-        presence.start()
         startMaintenanceLoop()
         appLog.log(.info, category: "appstate", "start all")
-    }
-
-    func togglePresence() {
-        if presenceEnabled {
-            presence.stop()
-        } else {
-            presence.start()
-        }
-        appLog.log(.info, category: "appstate", "presence toggled", metadata: ["requested_enabled": String(!presenceEnabled)])
     }
 
     func stopTracking() {
@@ -81,7 +63,6 @@ final class AppState: ObservableObject {
 
     func shutdown() {
         tracking.stop()
-        presence.stop()
         trackingEnabled = false
         maintenanceTimer?.invalidate()
         maintenanceTimer = nil
@@ -94,32 +75,10 @@ final class AppState: ObservableObject {
         saveCounterSeconds = 0
     }
 
-    func setGoal(hours: Double) {
-        goals.setGoal(hours: hours)
-    }
-
     func resetToday() {
         tracking.reset()
-        lastMaintenanceTick = .now
         saveNow()
         appLog.log(.info, category: "appstate", "today reset")
-    }
-
-    func exportTodayCSV() -> URL? {
-        storage.exportCSV(record: tracking.record, classify: categories.classify)
-    }
-
-    func weeklyTrendsText() -> String {
-        trends.weeklyTrends(weeks: 1)
-    }
-
-    @discardableResult
-    func recategorise(appName: String, category: String) -> Bool {
-        let ok = categories.setCategory(appName: appName, category: category)
-        if ok {
-            appLog.log(.info, category: "appstate", "recategorised app", metadata: ["app": appName, "category": category])
-        }
-        return ok
     }
 
     @discardableResult
@@ -134,145 +93,145 @@ final class AppState: ObservableObject {
         return ok
     }
 
+    // MARK: - Permissions
+
+    private func requestPermissionsOnFirstLaunch() {
+        // 1. Accessibility — triggers the system prompt automatically
+        let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary
+        let trusted = AXIsProcessTrustedWithOptions(opts)
+        appLog.log(.info, category: "permissions", "accessibility trusted=\(trusted)")
+
+        // 2. Automation — handled lazily during tracking.
+        //    macOS shows "Allow <app> to control <browser>?" the first time
+        //    an AppleScript targets a *running* browser. No need to trigger it
+        //    here — TrackingService.frontmostBrowserDomain() will fire it
+        //    naturally the first time the user switches to each browser.
+    }
+
     private func startMaintenanceLoop() {
         guard maintenanceTimer == nil else { return }
-        lastMaintenanceTick = .now
-        maintenanceTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+        let t = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 self?.maintenanceTick()
             }
         }
+        RunLoop.main.add(t, forMode: .common)
+        maintenanceTimer = t
     }
 
     private func maintenanceTick() {
-        guard trackingEnabled else { return }
-
-        let now = Date()
-        let elapsed = now.timeIntervalSince(lastMaintenanceTick)
-        lastMaintenanceTick = now
-
-        if presenceEnabled && presenceIsAway {
-            tracking.addAway(seconds: elapsed)
+        // Update frontmost app icon
+        if let app = NSWorkspace.shared.frontmostApplication {
+            let icon = app.icon
+            icon?.size = NSSize(width: 18, height: 18)
+            frontmostAppIcon = icon
         }
 
-        saveCounterSeconds += elapsed
+        objectWillChange.send()
+
+        guard trackingEnabled else { return }
+
+        saveCounterSeconds += 1
         if saveCounterSeconds >= 30 {
             saveNow()
             appLog.log(.debug, category: "appstate", "auto-saved")
         }
-
-        if goals.shouldNotify(appSeconds: tracking.record.appSeconds, today: tracking.record.date) {
-            postGoalReachedNotification()
-        }
     }
 
-    private func requestNotificationPermission() {
-        guard canUseSystemNotifications() else {
-            appLog.log(.warning, category: "appstate", "notifications disabled in unbundled run")
-            return
-        }
-
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { [weak self] granted, error in
-            guard let self else { return }
-            if let error {
-                self.appLog.log(.error, category: "appstate", "notification permission error", metadata: ["error": error.localizedDescription])
-                return
-            }
-            self.appLog.log(.info, category: "appstate", "notification permission", metadata: ["granted": String(granted)])
-        }
-    }
-
-    private func postGoalReachedNotification() {
-        guard canUseSystemNotifications() else {
-            appLog.log(.info, category: "appstate", "goal reached notification skipped in unbundled run")
-            return
-        }
-
-        let content = UNMutableNotificationContent()
-        content.title = "Goal reached 🎯"
-        content.body = "You reached your productive-hours goal for today."
-        content.sound = .default
-
-        let request = UNNotificationRequest(identifier: "donna-goal-reached-\(tracking.record.date)", content: content, trigger: nil)
-        UNUserNotificationCenter.current().add(request) { [weak self] error in
-            if let error {
-                self?.appLog.log(.error, category: "appstate", "goal notification failed", metadata: ["error": error.localizedDescription])
-            } else {
-                self?.appLog.log(.info, category: "appstate", "goal notification posted")
-            }
-        }
-    }
-
-    private func canUseSystemNotifications() -> Bool {
-        guard Bundle.main.bundleIdentifier != nil else { return false }
-        return !Bundle.main.bundleURL.path.contains("/.build/")
-    }
-
-    private func setupPresenceBindings() {
-        presence.$isEnabled
+    private func bindTrackingChanges() {
+        tracking.$record
             .receive(on: RunLoop.main)
-            .sink { [weak self] enabled in
-                self?.presenceEnabled = enabled
+            .sink { [weak self] _ in
+                self?.objectWillChange.send()
             }
             .store(in: &cancellables)
 
-        presence.$isAway
+        tracking.$currentApp
             .receive(on: RunLoop.main)
-            .sink { [weak self] away in
-                self?.presenceIsAway = away
+            .sink { [weak self] _ in
+                self?.objectWillChange.send()
+            }
+            .store(in: &cancellables)
+
+        tracking.$debugIdleSeconds
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.objectWillChange.send()
             }
             .store(in: &cancellables)
     }
 
     var menuTitle: String {
-        let catTotals = categories.categorise(tracking.record.appSeconds)
-        let progress = goals.progress(appSeconds: tracking.record.appSeconds)
-        let awayTag = presenceEnabled && presenceIsAway ? " · 🚶away" : ""
-        return "⏱ \(fmtHM(tracking.record.activeSeconds)) active · 🟢\(fmtHM(catTotals["productive", default: 0])) · 🔴\(fmtHM(catTotals["distracting", default: 0])) · 🎯\(Int(progress.percent))%\(awayTag)"
-    }
-
-    var presenceStatusText: String {
-        guard presenceEnabled else { return "📷 Presence: Off" }
-        return presenceIsAway ? "📷 Presence: Away" : "📷 Presence: Present"
-    }
-
-    func summaryText() -> String {
         let r = tracking.record
-        let catTotals = categories.categorise(r.appSeconds)
-        let p = goals.progress(appSeconds: r.appSeconds)
-        let topApps = r.appSeconds
+        return "Active \(fmtSmart(r.activeSeconds))"
+    }
+
+    private func fmtSmart(_ seconds: Double) -> String {
+        let s = Int(seconds.rounded())
+        if s < 60 { return "\(s)s" }
+        if s < 3600 { return "\(s / 60)m" }
+        let h = s / 3600
+        let m = (s % 3600) / 60
+        return m > 0 ? "\(h)h \(m)m" : "\(h)h"
+    }
+
+    struct SummaryData {
+        let date: String
+        let activeTime: String
+        let ideTime: String
+        let aiTime: String
+        let aiPercent: Int
+        let topApps: [(name: String, time: String, fraction: Double)]
+    }
+
+    func summaryData() -> SummaryData {
+        let r = tracking.record
+        let ide = ideSeconds(in: r.appSeconds)
+        let ai = aiToolSeconds(in: r.appSeconds)
+        let pct = r.activeSeconds > 0 ? (ai / r.activeSeconds) * 100 : 0
+        let maxSec = r.appSeconds.values.max() ?? 1
+
+        let top = r.appSeconds
             .sorted { $0.value > $1.value }
             .prefix(5)
+            .map { (name: $0.key, time: fmtHM($0.value), fraction: $0.value / maxSec) }
 
-        let topAppLines: String
-        if topApps.isEmpty {
-            topAppLines = "  (no tracked apps yet)"
-        } else {
-            topAppLines = topApps.enumerated().map { idx, pair in
-                let app = pair.key
-                let secs = pair.value
-                let cat = categories.classify(app)
-                let emoji = cat == "productive" ? "🟢" : (cat == "distracting" ? "🔴" : "⚪")
-                return "  \(idx + 1). \(emoji) \(app): \(fmtHM(secs))"
-            }.joined(separator: "\n")
+        return SummaryData(
+            date: r.date,
+            activeTime: fmtHM(r.activeSeconds),
+            ideTime: fmtHM(ide),
+            aiTime: fmtHM(ai),
+            aiPercent: Int(pct.rounded()),
+            topApps: top
+        )
+    }
+
+    private func ideSeconds(in appSeconds: [String: Double]) -> Double {
+        let ideNames: Set<String> = [
+            "Xcode", "Visual Studio Code", "Code", "Cursor", "Windsurf",
+            "IntelliJ IDEA", "PyCharm", "WebStorm", "CLion", "GoLand", "Rider", "Fleet", "Zed", "Nova", "Sublime Text"
+        ]
+        return appSeconds.reduce(0) { partial, item in
+            partial + (ideNames.contains(item.key) ? item.value : 0)
         }
+    }
 
-        return """
-        📅 \(r.date)
-        ✅ Active: \(fmtHM(r.activeSeconds))
-        💤 Idle:   \(fmtHM(r.idleSeconds))
-        🚶 Away:   \(fmtHM(r.awaySeconds))
-
-        🎯 Goal: \(String(format: "%.1f", p.currentHours))h / \(String(format: "%.1f", p.goalHours))h (\(Int(p.percent))%)
-
-        Category breakdown:
-          🟢 Productive: \(fmtHM(catTotals["productive", default: 0]))
-          🔴 Distracting: \(fmtHM(catTotals["distracting", default: 0]))
-          ⚪ Neutral: \(fmtHM(catTotals["neutral", default: 0]))
-
-                Top apps today:
-                \(topAppLines)
-        """
+    private func aiToolSeconds(in appSeconds: [String: Double]) -> Double {
+        let aiKeywords: [String] = [
+            "ChatGPT", "Claude", "Perplexity", "Microsoft Copilot",
+            "Gemini", "Grok", "Mistral", "HuggingChat", "Poe",
+            "Phind", "You.com", "Replit AI", "v0",
+            "DeepSeek", "Codeium", "Copilot", "Cody",
+            "Amazon Q", "Tabnine"
+        ]
+        return appSeconds.reduce(0) { partial, item in
+            // Match any key containing an AI keyword
+            // Covers: "Google Chrome (ChatGPT)", "GitHub Copilot (Code)", "ChatGPT", etc.
+            for keyword in aiKeywords {
+                if item.key.contains(keyword) { return partial + item.value }
+            }
+            return partial
+        }
     }
 
     private static func resolveDataDirectory() -> URL {

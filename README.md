@@ -1,100 +1,69 @@
-# Donna – macOS Menu Bar Productivity Tracker (Swift)
+# Donna
 
-Donna is a privacy-first macOS menu bar app that tracks app usage, idle time, away-from-desk time (camera presence), goals, and trends — all stored locally.
+A privacy-first macOS menu bar tracker focused on one question: **how much of your coding time is AI-assisted**.
 
-## Current Status
+The app tracks frontmost app usage, idle time, and AI-tool time for major AI surfaces (ChatGPT, Claude, Perplexity, GitHub Copilot web) using local-only processing and local storage in [data](data).
 
-- Primary app: Swift (in [DonnaSwift](DonnaSwift))
-- Local storage: JSON in [data](data)
-- Logging: structured JSON logs in [data/logs/donna.log](data/logs/donna.log)
-- Browser extension tracking: removed
+Core app code lives in [DonnaSwift](DonnaSwift), with orchestration in [DonnaSwift/Sources/DonnaMacApp/AppState.swift](DonnaSwift/Sources/DonnaMacApp/AppState.swift), tracking logic in [DonnaSwift/Sources/DonnaMacApp/Services/TrackingService.swift](DonnaSwift/Sources/DonnaMacApp/Services/TrackingService.swift), and persistence in [DonnaSwift/Sources/DonnaMacApp/Services/StorageService.swift](DonnaSwift/Sources/DonnaMacApp/Services/StorageService.swift).
 
-## Features
+## Interesting implementation techniques
 
-- Frontmost app tracking (active time)
-- Idle detection
-- Camera-based presence detection (away time)
-- Daily productive-time goals
-- Daily summary popup
-- Weekly trends dashboard popup
-- CSV export for today
-- Per-app category overrides (productive/distracting/neutral)
-- Launch at Login toggle (LaunchAgent)
-- Auto-save + manual save
-- Structured logging
+- **Timer-driven sampling loop** for frontmost app and idle state in [DonnaSwift/Sources/DonnaMacApp/Services/TrackingService.swift](DonnaSwift/Sources/DonnaMacApp/Services/TrackingService.swift).
+	If you’re coming from web runtimes, this is conceptually similar to [`setInterval()`](https://developer.mozilla.org/en-US/docs/Web/API/Window/setInterval).
 
-## Project Structure
+- **OS-level idle detection** through Quartz event APIs instead of app-local input hooks.
+	This gives a cleaner signal than UI event listeners and avoids invasive instrumentation.
 
-```
+- **Surface normalization for AI domains** (browser tab URL → canonical AI tool label) in [DonnaSwift/Sources/DonnaMacApp/Services/TrackingService.swift](DonnaSwift/Sources/DonnaMacApp/Services/TrackingService.swift).
+	Domain extraction maps well to URL parsing semantics like [`URL.hostname`](https://developer.mozilla.org/en-US/docs/Web/API/URL/hostname).
+
+- **Structured daily persistence** via Codable JSON in [DonnaSwift/Sources/DonnaMacApp/Models/DailyRecord.swift](DonnaSwift/Sources/DonnaMacApp/Models/DailyRecord.swift) and [DonnaSwift/Sources/DonnaMacApp/Services/StorageService.swift](DonnaSwift/Sources/DonnaMacApp/Services/StorageService.swift).
+	Format choice mirrors well-known [JSON](https://developer.mozilla.org/en-US/docs/Learn_web_development/Core/Scripting/JSON) workflows.
+
+- **Menu-bar-first UX architecture** using SwiftUI scene composition in [DonnaSwift/Sources/DonnaMacApp/DonnaMacApp.swift](DonnaSwift/Sources/DonnaMacApp/DonnaMacApp.swift), with a single app coordinator (`AppState`) for predictable state transitions.
+
+## Non-obvious technologies and libraries
+
+- [SwiftUI](https://developer.apple.com/xcode/swiftui/) for menu bar scene composition.
+- [AppKit](https://developer.apple.com/documentation/appkit) for macOS-native alerts and status-bar behavior.
+- [Quartz Event Services](https://developer.apple.com/documentation/coregraphics/quartz_event_services) for idle-time detection.
+- [NSAppleScript](https://developer.apple.com/documentation/foundation/nsapplescript) for active browser tab URL introspection.
+- [os.Logger](https://developer.apple.com/documentation/os/logger) for structured system logging.
+- [Swift Package Manager](https://www.swift.org/package-manager/) for build/dependency workflow.
+
+### Fonts and UI assets
+
+- No external font package is bundled.
+- UI uses macOS system typography (San Francisco family) and system symbols where available.
+	References: [SF Symbols](https://developer.apple.com/sf-symbols/), [Apple Fonts](https://developer.apple.com/fonts/).
+
+## Project structure
+
+```text
 Donna/
+├── CONTRIBUTING.md
+├── DESIGN.md
+├── LICENSE
+├── README.md
+├── prompt.md
 ├── DonnaSwift/
-│   ├── Package.swift
-│   └── Sources/DonnaMacApp/
-│       ├── DonnaMacApp.swift
-│       ├── AppState.swift
-│       ├── Models/
-│       │   └── DailyRecord.swift
-│       └── Services/
-│           ├── AppLog.swift
-│           ├── CategoryService.swift
-│           ├── GoalService.swift
-│           ├── LaunchAtLoginService.swift
-│           ├── PresenceService.swift
-│           ├── StorageService.swift
-│           ├── TrackingService.swift
-│           └── TrendsService.swift
-├── data/
-│   ├── YYYY-MM-DD.json
-│   ├── goals.json
-│   ├── categories.json
-│   └── logs/
-│       └── donna.log
-└── README.md
+│   ├── .build/
+│   └── Sources/
+│       └── DonnaMacApp/
+│           ├── Models/
+│           └── Services/
+└── data/
+		└── logs/
 ```
 
-## Run
+- [DonnaSwift](DonnaSwift): Swift package root and app source.
+- [DonnaSwift/Sources/DonnaMacApp](DonnaSwift/Sources/DonnaMacApp): app entrypoint and app state layer.
+- [DonnaSwift/Sources/DonnaMacApp/Models](DonnaSwift/Sources/DonnaMacApp/Models): persistence model types.
+- [DonnaSwift/Sources/DonnaMacApp/Services](DonnaSwift/Sources/DonnaMacApp/Services): tracking, storage, and logging services.
+- [data](data): local runtime records (intentionally local-first).
+- [data/logs](data/logs): runtime logs.
 
-From repo root:
+## Release focus
 
-```bash
-swift run --package-path DonnaSwift DonnaMacApp
-```
-
-Or from [DonnaSwift](DonnaSwift):
-
-```bash
-swift run DonnaMacApp
-```
-
-## Menu Actions
-
-- Start/Pause Tracking
-- Reset Today
-- Today's Summary
-- Weekly Trends
-- Export CSV
-- Set Goal
-- Categorise App…
-- Enable/Disable Launch at Login
-- Enable/Disable Camera Presence
-- Save Now
-- Quit
-
-## Data Files
-
-- Daily records: [data](data)/YYYY-MM-DD.json
-- Goals: [data/goals.json](data/goals.json)
-- Category overrides: [data/categories.json](data/categories.json)
-- Logs: [data/logs/donna.log](data/logs/donna.log)
-
-## Privacy
-
-- Data stays local.
-- No external server sync.
-- Camera is only used for local face-presence detection.
-- Website/domain tracking via extension is not part of the current app.
-
-## Notes
-
-- Running via `swift run` is unbundled; some macOS notification/login-item behavior can vary from a signed .app build.
-- Legacy Python files were removed; this repository now contains only the active Swift app path.
+This release is intentionally narrow: reliable tracking + clear daily AI leverage summary.
+No cloud sync, no remote analytics, no prompt/content collection.

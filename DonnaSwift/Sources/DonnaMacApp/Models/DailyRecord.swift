@@ -4,20 +4,17 @@ struct DailyRecord: Codable {
     var date: String
     var activeSeconds: Double
     var idleSeconds: Double
-    var awaySeconds: Double
     var appSeconds: [String: Double]
 
     init(
         date: String = DailyRecord.today(),
         activeSeconds: Double = 0,
         idleSeconds: Double = 0,
-        awaySeconds: Double = 0,
         appSeconds: [String: Double] = [:]
     ) {
         self.date = date
         self.activeSeconds = activeSeconds
         self.idleSeconds = idleSeconds
-        self.awaySeconds = awaySeconds
         self.appSeconds = appSeconds
     }
 
@@ -30,10 +27,6 @@ struct DailyRecord: Codable {
         idleSeconds += seconds
     }
 
-    mutating func addAway(seconds: Double) {
-        awaySeconds += seconds
-    }
-
     static func today() -> String {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withFullDate]
@@ -44,7 +37,6 @@ struct DailyRecord: Codable {
         case date
         case activeSeconds = "active_seconds"
         case idleSeconds = "idle_seconds"
-        case awaySeconds = "away_seconds"
         case appSeconds = "app_seconds"
     }
 }

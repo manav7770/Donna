@@ -1,122 +1,124 @@
 import Foundation
+import ServiceManagement
+import os
 
 final class LaunchAtLoginService {
+    private let logger = Logger(subsystem: "DonnaSwift", category: "launchAtLogin")
     private let appLog = AppLog.shared
-
-    private let label = "com.donna.tracker.swift"
-    private let plistURL: URL
-
-    init() {
-        let dir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/LaunchAgents", isDirectory: true)
-        self.plistURL = dir.appendingPathComponent("com.donna.tracker.swift.plist")
-    }
+    private let label = "com.donna.DonnaMacApp"
 
     func isEnabled() -> Bool {
-        FileManager.default.fileExists(atPath: plistURL.path)
-    }
-
-    @discardableResult
-    func setEnabled(_ enabled: Bool) -> Bool {
-        enabled ? install() : uninstall()
-    }
-
-    private func install() -> Bool {
-        guard let executable = resolvedExecutablePath() else {
-            appLog.log(.error, category: "autostart", "cannot resolve executable path")
-            return false
+        if canUseSMAppService() {
+            return SMAppService.mainApp.status == .enabled || SMAppService.mainApp.status == .requiresApproval
         }
 
-        let workingDirectory = URL(fileURLWithPath: executable).deletingLastPathComponent().path
-        let dataDir = resolvedDataDirectoryPath()
+        return FileManager.default.fileExists(atPath: launchAgentURL.path)
+    }
 
+    func setEnabled(_ enabled: Bool) -> Bool {
+        if canUseSMAppService() {
+            return setEnabledViaSMAppService(enabled)
+        }
+
+        return setEnabledViaLaunchAgent(enabled)
+    }
+
+    private func canUseSMAppService() -> Bool {
+        guard Bundle.main.bundleIdentifier != nil else { return false }
+        return !Bundle.main.bundleURL.path.contains("/.build/")
+    }
+
+    private func setEnabledViaSMAppService(_ enabled: Bool) -> Bool {
+        do {
+            if enabled {
+                try SMAppService.mainApp.register()
+            } else {
+                try SMAppService.mainApp.unregister()
+            }
+
+            let current = isEnabled()
+            appLog.log(.info, category: "launchAtLogin", "updated via ServiceManagement", metadata: ["enabled": String(current)])
+            return current == enabled || (enabled && SMAppService.mainApp.status == .requiresApproval)
+        } catch {
+            logger.error("ServiceManagement update failed: \(error.localizedDescription, privacy: .public)")
+            appLog.log(.error, category: "launchAtLogin", "ServiceManagement update failed", metadata: ["error": error.localizedDescription, "requested": String(enabled)])
+            // Fallback for development / unbundled runs.
+            return setEnabledViaLaunchAgent(enabled)
+        }
+    }
+
+    private func setEnabledViaLaunchAgent(_ enabled: Bool) -> Bool {
+        do {
+            if enabled {
+                try installLaunchAgent()
+                // Do not load immediately. Loading with RunAtLoad can spawn a second Donna process
+                // in the current session. Saving the agent file is enough for next login.
+            } else {
+                _ = runLaunchctl(["unload", launchAgentURL.path])
+                try? FileManager.default.removeItem(at: launchAgentURL)
+            }
+
+            let current = isEnabled()
+            appLog.log(.info, category: "launchAtLogin", "updated via LaunchAgent", metadata: ["enabled": String(current)])
+            return current == enabled
+        } catch {
+            logger.error("LaunchAgent update failed: \(error.localizedDescription, privacy: .public)")
+            appLog.log(.error, category: "launchAtLogin", "LaunchAgent update failed", metadata: ["error": error.localizedDescription, "requested": String(enabled)])
+            return false
+        }
+    }
+
+    private var launchAgentURL: URL {
+        let base = FileManager.default.homeDirectoryForCurrentUser
+        return base
+            .appendingPathComponent("Library", isDirectory: true)
+            .appendingPathComponent("LaunchAgents", isDirectory: true)
+            .appendingPathComponent("\(label).plist", isDirectory: false)
+    }
+
+    private func installLaunchAgent() throws {
+        let launchAgentsDir = launchAgentURL.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: launchAgentsDir, withIntermediateDirectories: true)
+
+        let executable = resolvedExecutablePath()
         let plist: [String: Any] = [
             "Label": label,
             "ProgramArguments": [executable],
             "RunAtLoad": true,
             "KeepAlive": false,
-            "WorkingDirectory": workingDirectory,
-            "StandardOutPath": (dataDir as NSString).appendingPathComponent("donna_stdout.log"),
-            "StandardErrorPath": (dataDir as NSString).appendingPathComponent("donna_stderr.log")
+            "ProcessType": "Interactive",
         ]
 
-        do {
-            try FileManager.default.createDirectory(at: plistURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-            let data = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
-            try data.write(to: plistURL)
+        let data = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+        try data.write(to: launchAgentURL, options: .atomic)
+    }
 
-            _ = runLaunchctl(["unload", "-w", plistURL.path])
-            _ = runLaunchctl(["load", "-w", plistURL.path])
-            appLog.log(.info, category: "autostart", "enabled", metadata: ["plist": plistURL.path, "executable": executable])
-            return true
+    private func resolvedExecutablePath() -> String {
+        if let bundleExec = Bundle.main.executableURL?.path,
+           !bundleExec.contains("/.build/") {
+            return bundleExec
+        }
+
+        if let arg0 = CommandLine.arguments.first, !arg0.isEmpty {
+            return URL(fileURLWithPath: arg0).standardizedFileURL.path
+        }
+
+        return ProcessInfo.processInfo.arguments.first ?? ""
+    }
+
+    @discardableResult
+    private func runLaunchctl(_ args: [String]) -> Bool {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        task.arguments = args
+
+        do {
+            try task.run()
+            task.waitUntilExit()
+            return task.terminationStatus == 0
         } catch {
-            appLog.log(.error, category: "autostart", "enable failed", metadata: ["error": error.localizedDescription])
+            appLog.log(.error, category: "launchAtLogin", "launchctl failed", metadata: ["error": error.localizedDescription, "args": args.joined(separator: " ")])
             return false
         }
-    }
-
-    private func uninstall() -> Bool {
-        guard FileManager.default.fileExists(atPath: plistURL.path) else {
-            return true
-        }
-
-        _ = runLaunchctl(["unload", "-w", plistURL.path])
-        do {
-            try FileManager.default.removeItem(at: plistURL)
-            appLog.log(.info, category: "autostart", "disabled", metadata: ["plist": plistURL.path])
-            return true
-        } catch {
-            appLog.log(.error, category: "autostart", "disable failed", metadata: ["error": error.localizedDescription])
-            return false
-        }
-    }
-
-    private func runLaunchctl(_ args: [String]) -> Int32 {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-        process.arguments = args
-        do {
-            try process.run()
-            process.waitUntilExit()
-            return process.terminationStatus
-        } catch {
-            appLog.log(.error, category: "autostart", "launchctl failed", metadata: ["error": error.localizedDescription])
-            return -1
-        }
-    }
-
-    private func resolvedExecutablePath() -> String? {
-        if let bundledExecutable = Bundle.main.executablePath,
-           !bundledExecutable.contains("/.build/") {
-            return bundledExecutable
-        }
-
-        // Fallback for swift run/debug environments.
-        let cwd = FileManager.default.currentDirectoryPath
-        let candidates = [
-            URL(fileURLWithPath: cwd).appendingPathComponent("DonnaSwift/.build/arm64-apple-macosx/debug/DonnaMacApp").path,
-            URL(fileURLWithPath: cwd).appendingPathComponent(".build/arm64-apple-macosx/debug/DonnaMacApp").path,
-            URL(fileURLWithPath: cwd).appendingPathComponent("DonnaSwift/.build/debug/DonnaMacApp").path,
-            URL(fileURLWithPath: cwd).appendingPathComponent(".build/debug/DonnaMacApp").path
-        ]
-
-        return candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) })
-    }
-
-    private func resolvedDataDirectoryPath() -> String {
-        if let env = ProcessInfo.processInfo.environment["DONNA_DATA_DIR"], !env.isEmpty {
-            return env
-        }
-        let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
-        let direct = cwd.appendingPathComponent("data", isDirectory: true).standardizedFileURL
-        if FileManager.default.fileExists(atPath: direct.path) {
-            return direct.path
-        }
-        let parent = cwd.appendingPathComponent("../data", isDirectory: true).standardizedFileURL
-        if FileManager.default.fileExists(atPath: parent.path) {
-            return parent.path
-        }
-        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        return support.appendingPathComponent("Donna/data", isDirectory: true).path
     }
 }

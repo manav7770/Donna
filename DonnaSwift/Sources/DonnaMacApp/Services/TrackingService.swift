@@ -87,16 +87,25 @@ final class TrackingService: ObservableObject {
         debugIdleSeconds = idleSeconds
 
         if idleSeconds >= idleThreshold {
+            // User was idle for the whole interval
             record.addIdle(seconds: elapsed)
             currentApp = "—"
         } else {
+            // User was active for part of the interval
+            // Only count as active the time since last input, rest is idle
+            let sinceInput = min(elapsed, max(0, elapsed - idleSeconds))
+            let idlePart = elapsed - sinceInput
             let surface = frontmostSurface()
-            record.addActive(app: surface, seconds: elapsed)
-            currentApp = surface
-            
-            // Debug: log when we detect AI tools
-            if surface.contains("Copilot") || surface.contains("ChatGPT") || surface.contains("Claude") {
-                logger.info("🤖 AI detected: \(surface, privacy: .public)")
+            if sinceInput > 0 {
+                record.addActive(app: surface, seconds: sinceInput)
+                currentApp = surface
+                // Debug: log when we detect AI tools
+                if surface.contains("Copilot") || surface.contains("ChatGPT") || surface.contains("Claude") {
+                    logger.info("🤖 AI detected: \(surface, privacy: .public)")
+                }
+            }
+            if idlePart > 0 {
+                record.addIdle(seconds: idlePart)
             }
         }
     }

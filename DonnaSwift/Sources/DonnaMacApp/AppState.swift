@@ -7,6 +7,7 @@ import Combine
 final class AppState: ObservableObject {
     private let logger = Logger(subsystem: "DonnaSwift", category: "appstate")
     private let appLog = AppLog.shared
+    private var lockFileDescriptor: Int32 = -1
 
     let storage: StorageService
     let tracking: TrackingService
@@ -25,6 +26,7 @@ final class AppState: ObservableObject {
         self.tracking = TrackingService()
         self.launchAtLogin = LaunchAtLoginService()
         self.launchAtLoginEnabled = launchAtLogin.isEnabled()
+        acquireSingleInstanceLock(at: dataDir)
         bindTrackingChanges()
 
         // Enable launch-at-login by default on first run
@@ -235,32 +237,78 @@ final class AppState: ObservableObject {
     }
 
     private static func resolveDataDirectory() -> URL {
-        if let env = ProcessInfo.processInfo.environment["DONNA_DATA_DIR"], !env.isEmpty {
-            return URL(fileURLWithPath: env, isDirectory: true)
-        }
-
-        // If running from repo root, this points at ./data.
-        let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
-        let directData = cwd.appendingPathComponent("data", isDirectory: true).standardizedFileURL
-        if FileManager.default.fileExists(atPath: directData.path) {
-            return directData
-        }
-
-        // If running from DonnaSwift/, this points at ../data.
-        let parentData = cwd.appendingPathComponent("../data", isDirectory: true).standardizedFileURL
-        if FileManager.default.fileExists(atPath: parentData.path) {
-            return parentData
-        }
-
-        // Fallback for app bundle runs.
-        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        return support.appendingPathComponent("Donna/data", isDirectory: true)
+    let fm = FileManager.default
+    
+    // 1. Environment override
+    if let env = ProcessInfo.processInfo.environment["DONNA_DATA_DIR"],
+       !env.isEmpty {
+        let url = URL(fileURLWithPath: env, isDirectory: true)
+        ensureDirectoryExists(at: url)
+        return url
     }
+
+    // 2. Dev: ./data
+    let cwd = URL(fileURLWithPath: fm.currentDirectoryPath, isDirectory: true)
+    let directData = cwd.appendingPathComponent("data", isDirectory: true)
+    if fm.fileExists(atPath: directData.path) {
+        ensureDirectoryExists(at: directData)
+        return directData
+    }
+
+    // 3. Dev: ../data
+    let parentData = cwd.appendingPathComponent("../data", isDirectory: true)
+        .standardizedFileURL
+    if fm.fileExists(atPath: parentData.path) {
+        ensureDirectoryExists(at: parentData)
+        return parentData
+    }
+
+    // 4. Production fallback
+    let support = fm.urls(for: .applicationSupportDirectory,
+                          in: .userDomainMask).first!
+    let finalURL = support.appendingPathComponent("Donna/data",
+                                                  isDirectory: true)
+
+    ensureDirectoryExists(at: finalURL)
+    return finalURL
+}
+
+private static func ensureDirectoryExists(at url: URL) {
+    let fm = FileManager.default
+    var isDir: ObjCBool = false
+
+    if fm.fileExists(atPath: url.path, isDirectory: &isDir) {
+        if !isDir.boolValue {
+            fatalError("Path exists but is not a directory: \(url.path)")
+        }
+        return
+    }
+
+    do {
+        try fm.createDirectory(at: url,
+                               withIntermediateDirectories: true,
+                               attributes: nil)
+    } catch {
+        fatalError("Failed to create data directory at \(url.path): \(error)")
+    }
+}
 
     private func fmtHM(_ seconds: Double) -> String {
         let totalMinutes = Int(seconds / 60)
         let h = totalMinutes / 60
         let m = totalMinutes % 60
         return h > 0 ? "\(h)h \(String(format: "%02d", m))m" : "\(m)m"
+    }
+    private func acquireSingleInstanceLock(at directory: URL) {
+    let lockURL = directory.appendingPathComponent("app.lock")
+
+    lockFileDescriptor = open(lockURL.path, O_CREAT | O_RDWR, 0o644)
+    if lockFileDescriptor == -1 {
+        fatalError("Unable to open lock file")
+    }
+
+    if flock(lockFileDescriptor, LOCK_EX | LOCK_NB) != 0 {
+        fatalError("Another instance of the app is already running.")
+    }
     }
 }

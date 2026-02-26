@@ -4,7 +4,6 @@ import Quartz
 import IOKit
 import os
 
-
 @MainActor
 final class TrackingService: ObservableObject {
     private let logger = Logger(subsystem: "DonnaSwift", category: "tracking")
@@ -14,18 +13,21 @@ final class TrackingService: ObservableObject {
     @Published private(set) var currentApp: String = "—"
     @Published private(set) var debugIdleSeconds: TimeInterval = 0
 
-    var pollInterval: TimeInterval = 30
+    var pollInterval: TimeInterval = 60
     var idleThreshold: TimeInterval = 300
 
     private var timer: Timer?
     private var lastTick: Date?
     private var lastInputDate = Date()
     private var eventMonitors: [Any] = []
-    
+
     // Cache for AI extension process detection (avoid running ps aux repeatedly)
     private var aiProcessCache: String?
     private var aiProcessCacheTime: Date?
     private let aiProcessCacheDuration: TimeInterval = 10  // Cache for 10 seconds
+
+    // Optional cache for browser domain lookups (short lived)
+    private var browserDomainCache: (appName: String, domain: String?, time: Date)?
 
     func start() {
         guard timer == nil else { return }
@@ -64,7 +66,6 @@ final class TrackingService: ObservableObject {
         appLog.log(.info, category: "tracking", "record loaded", metadata: ["date": record.date])
     }
 
-   
     private func tick() {
         let now = Date()
         let today = DailyRecord.today()
@@ -93,14 +94,15 @@ final class TrackingService: ObservableObject {
         } else {
             // User was active for part of the interval
             // Only count as active the time since last input, rest is idle
-            let sinceInput = min(elapsed, max(0, elapsed - idleSeconds))
+            let sinceInput = max(0, elapsed - idleSeconds)
             let idlePart = elapsed - sinceInput
             let surface = frontmostSurface()
             if sinceInput > 0 {
                 record.addActive(app: surface, seconds: sinceInput)
                 currentApp = surface
-                // Debug: log when we detect AI tools
-                if surface.contains("Copilot") || surface.contains("ChatGPT") || surface.contains("Claude") {
+                // Quick immediate AI logging (case-insensitive)
+                let lower = surface.lowercased()
+                if lower.contains("copilot") || lower.contains("chatgpt") || lower.contains("claude") {
                     logger.info("🤖 AI detected: \(surface, privacy: .public)")
                 }
             }
@@ -197,13 +199,13 @@ final class TrackingService: ObservableObject {
     private func frontmostSurface() -> String {
         let appName = frontmostApp() ?? "Unknown"
 
-        // Check browser tabs for AI tool domains
+        // Check browser tabs for AI tool domains (uses a short cache)
         if let domain = frontmostBrowserDomain(appName: appName),
            let aiTool = aiToolName(forDomain: domain) {
             return "\(appName) (\(aiTool))"
         }
 
-        // Check if IDE has Copilot/AI assistant active via window title
+        // Check if IDE has Copilot/AI assistant active via window title / extension process / AX tree
         if let aiLabel = aiAssistedIDE(appName: appName) {
             return aiLabel
         }
@@ -211,32 +213,39 @@ final class TrackingService: ObservableObject {
         return appName
     }
 
-    /// Detects if the frontmost IDE window shows an AI assistant (Copilot, Cody, etc.)
-    /// Checks window title first, then checks for running AI assistant processes.
-    private func aiAssistedIDE(appName: String) -> String? {
-        let ideApps: Set<String> = [
-            "Code", "Visual Studio Code", "Cursor", "Windsurf",
-            "Xcode", "IntelliJ IDEA", "PyCharm", "WebStorm",
-            "CLion", "GoLand", "Rider", "Fleet", "Zed", "Nova"
-        ]
-        guard ideApps.contains(appName) else { return nil }
+    // MARK: - IDE AI detection
 
-        // 1. Quick check: window title (catches some IDEs/setups)
-        if let title = frontmostWindowTitle() {
-            if let match = matchAIAssistant(title) { return "\(match) (\(appName))" }
+    /// List of supported IDE app names for AI detection
+    private static let ideApps: Set<String> = [
+        "Code", "Visual Studio Code", "Cursor", "Windsurf",
+        "Xcode", "IntelliJ IDEA", "PyCharm", "WebStorm",
+        "CLion", "GoLand", "Rider", "Fleet", "Zed", "Nova"
+    ]
+
+    /// Detects if the frontmost IDE window shows an AI assistant (Copilot, Cody, etc.)
+    /// Checks window title first, then checks for running AI assistant processes, then AX tree.
+    private func aiAssistedIDE(appName: String) -> String? {
+        let normalizedApp = appName.lowercased()
+
+        guard Self.ideApps.contains(where: { normalizedApp.contains($0.lowercased()) }) else {
+            return nil
         }
 
-        // 2. Check for AI assistant extension processes
-        // VS Code Copilot runs as extension processes that we can detect
+        // 1. Quick check: window title (catches some IDEs/setups)
+        if let title = frontmostWindowTitle(),
+           let match = matchAIAssistant(title) {
+            return "\(match) (\(appName))"
+        }
+
+        // 2. Check for AI assistant extension processes (non-blocking; returns cached or nil)
         if let match = detectAIExtensionProcess(for: appName) {
             return "\(match) (\(appName))"
         }
 
-        // 3. Deep check: scan the AX tree for AI panel/tab elements
-        // (This works for some IDEs but not Electron-based ones like VS Code)
+        // 3. Deep check: scan the AX tree for AI panel/tab elements (may be slower)
         guard let app = NSWorkspace.shared.frontmostApplication else { return nil }
         let axApp = AXUIElementCreateApplication(app.processIdentifier)
-        
+
         var windowsValue: AnyObject?
         if AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &windowsValue) == .success,
            let windows = windowsValue as? [AXUIElement] {
@@ -249,68 +258,80 @@ final class TrackingService: ObservableObject {
 
         return nil
     }
-    
+
     /// Detects AI assistant extension processes (for Electron-based IDEs like VS Code)
+    /// Non-blocking: returns cached result if fresh; otherwise schedules a background probe.
     private func detectAIExtensionProcess(for appName: String) -> String? {
         // Return cached result if still fresh
         if let cacheTime = aiProcessCacheTime,
            Date().timeIntervalSince(cacheTime) < aiProcessCacheDuration {
             return aiProcessCache
         }
-        
-        // Run detection in background to avoid blocking
-        let task = Process()
-        task.launchPath = "/bin/ps"
-        task.arguments = ["aux"]
-        
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        task.standardError = Pipe()
-        
-        do {
-            try task.run()
-            
-            // Use a timeout to avoid blocking too long
-            let deadline = Date().addingTimeInterval(0.5)
-            while task.isRunning && Date() < deadline {
-                Thread.sleep(forTimeInterval: 0.05)
+
+        // Kick off background probe (non-blocking)
+        Task.detached {
+            let (result, success) = await Self.runPSAndDetectAI()
+            await MainActor.run {
+                self.aiProcessCache = result
+                self.aiProcessCacheTime = Date()
+                if success {
+                    self.logger.debug("ai process detection result: \(result ?? "none")")
+                }
             }
-            
-            if task.isRunning {
-                task.terminate()
-                return aiProcessCache  // Return old cache if ps is slow
+        }
+        return aiProcessCache // usually nil on first run
+    }
+
+    // Helper runs ps aux in background and returns detection result.
+    // Runs off the main actor.
+    private static func runPSAndDetectAI() async -> (String?, Bool) {
+        return await withCheckedContinuation { continuation in
+            let task = Process()
+            task.executableURL = URL(fileURLWithPath: "/bin/ps")
+            task.arguments = ["aux"]
+
+            let pipe = Pipe()
+            task.standardOutput = pipe
+            task.standardError = Pipe()
+
+            task.terminationHandler = { process in
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                guard let output = String(data: data, encoding: .utf8) else {
+                    continuation.resume(returning: (nil, false))
+                    return
+                }
+
+                let lower = output.lowercased()
+
+                if lower.contains("copilot") && !lower.contains("grep") {
+                    continuation.resume(returning: ("GitHub Copilot", true))
+                    return
+                }
+
+                if lower.contains("cody") && !lower.contains("grep") {
+                    continuation.resume(returning: ("Sourcegraph Cody", true))
+                    return
+                }
+
+                if (lower.contains("codewhisperer") || lower.contains("amazon-q")) &&
+                    !lower.contains("grep") {
+                    continuation.resume(returning: ("Amazon Q", true))
+                    return
+                }
+
+                if lower.contains("tabnine") && !lower.contains("grep") {
+                    continuation.resume(returning: ("Tabnine", true))
+                    return
+                }
+
+                continuation.resume(returning: (nil, true))
             }
-            
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            guard let output = String(data: data, encoding: .utf8) else {
-                return aiProcessCache
+
+            do {
+                try task.run()
+            } catch {
+                continuation.resume(returning: (nil, false))
             }
-            
-            let lines = output.components(separatedBy: "\n")
-            var result: String? = nil
-            
-            // Check for Copilot extension processes
-            if lines.contains(where: { $0.contains("copilot") && !$0.contains("grep") }) {
-                result = "GitHub Copilot"
-            }
-            // Check for other AI assistants
-            else if lines.contains(where: { $0.contains("cody") && !$0.contains("grep") }) {
-                result = "Sourcegraph Cody"
-            }
-            else if lines.contains(where: { ($0.contains("codewhisperer") || $0.contains("amazon-q")) && !$0.contains("grep") }) {
-                result = "Amazon Q"
-            }
-            else if lines.contains(where: { $0.contains("tabnine") && !$0.contains("grep") }) {
-                result = "Tabnine"
-            }
-            
-            // Update cache
-            aiProcessCache = result
-            aiProcessCacheTime = Date()
-            
-            return result
-        } catch {
-            return aiProcessCache  // Return old cache on error
         }
     }
 
@@ -341,17 +362,17 @@ final class TrackingService: ObservableObject {
             kAXTitleAttribute as String,
             kAXDescriptionAttribute as String,
             "AXLabel",
-            "AXIdentifier", 
+            "AXIdentifier",
             kAXValueAttribute as String,
             kAXHelpAttribute as String
         ]
-        
+
         for attr in textAttributes {
             var attrValue: AnyObject?
             if AXUIElementCopyAttributeValue(element, attr as CFString, &attrValue) == .success,
                let text = attrValue as? String, !text.isEmpty {
-                if let match = matchAIAssistant(text) { 
-                    return match 
+                if let match = matchAIAssistant(text) {
+                    return match
                 }
             }
         }
@@ -372,6 +393,8 @@ final class TrackingService: ObservableObject {
         return nil
     }
 
+    // MARK: - Window title / browser domain helpers
+
     /// Gets the title of the frontmost window via Accessibility API, with CGWindowList fallback
     private func frontmostWindowTitle() -> String? {
         guard let app = NSWorkspace.shared.frontmostApplication else {
@@ -389,7 +412,6 @@ final class TrackingService: ObservableObject {
             if titleResult == .success, let title = titleValue as? String, !title.isEmpty {
                 return title
             }
-        } else {
         }
 
         // 2. Fallback: CGWindowList (works if Screen Recording is allowed)
@@ -419,6 +441,13 @@ final class TrackingService: ObservableObject {
     ])
 
     private func frontmostBrowserDomain(appName: String) -> String? {
+        // Check cache first (short lived)
+        if let cache = browserDomainCache,
+           cache.appName == appName,
+           Date().timeIntervalSince(cache.time) < 5 {
+            return cache.domain
+        }
+
         guard Self.allBrowsers.contains(appName) else { return nil }
 
         // 1. Try AppleScript URL introspection (most accurate, needs Automation permission)
@@ -433,17 +462,18 @@ final class TrackingService: ObservableObject {
                let url = URL(string: raw.trimmingCharacters(in: .whitespacesAndNewlines)),
                var host = url.host?.lowercased() {
                 if host.hasPrefix("www.") { host.removeFirst(4) }
+                browserDomainCache = (appName, host, Date())
                 return host
             }
         }
 
         // 2. Read URL from the browser's address bar via Accessibility API
-        //    Only needs Accessibility permission — works without Automation
         if let app = NSWorkspace.shared.frontmostApplication {
             if let urlString = browserURLViaAccessibility(pid: app.processIdentifier),
                let url = URL(string: urlString),
                var host = url.host?.lowercased() {
                 if host.hasPrefix("www.") { host.removeFirst(4) }
+                browserDomainCache = (appName, host, Date())
                 return host
             }
         }
@@ -451,9 +481,11 @@ final class TrackingService: ObservableObject {
         // 3. Fallback: window title keyword matching
         if let title = frontmostWindowTitle() {
             let domain = aiDomainFromWindowTitle(title)
+            browserDomainCache = (appName, domain, Date())
             return domain
         }
 
+        browserDomainCache = (appName, nil, Date())
         return nil
     }
 
@@ -468,10 +500,7 @@ final class TrackingService: ObservableObject {
             return nil
         }
 
-        let result = findURLFieldInElement(windowValue as! AXUIElement, depth: 0)
-        if result == nil {
-        }
-        return result
+        return findURLFieldInElement(windowValue as! AXUIElement, depth: 0)
     }
 
     /// Recursively searches AX tree for a text field containing a URL.
